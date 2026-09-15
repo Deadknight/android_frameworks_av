@@ -36,6 +36,10 @@
 
 #include "Codec2BufferUtils.h"
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 namespace android {
 
 namespace {
@@ -629,6 +633,142 @@ static const int16_t bt709Matrix[2][3][3] = {
     { { 47, 157, 16 }, { -26, -86, 112 }, { 112, -102, -10 } }, /* RANGE_LIMITED */
 };
 
+
+#if defined(__aarch64__)
+
+// ARDA_C2_RGB_I420_BT709_CUSTOM_NEON_V1_1
+// Exact limited-range BT.709 coefficients from bt709Matrix in this file.
+// Chroma sampling intentionally matches the scalar path: top-left pixel
+// of each 2x2 block, not a 2x2 average.
+
+static inline uint8x16_t ArdaBt709LimitedY16(
+        uint8x16_t r, uint8x16_t g, uint8x16_t b) {
+    uint16x8_t lo = vmull_u8(vget_low_u8(r), vdup_n_u8(47));
+    lo = vmlal_u8(lo, vget_low_u8(g), vdup_n_u8(157));
+    lo = vmlal_u8(lo, vget_low_u8(b), vdup_n_u8(16));
+
+    uint16x8_t hi = vmull_u8(vget_high_u8(r), vdup_n_u8(47));
+    hi = vmlal_u8(hi, vget_high_u8(g), vdup_n_u8(157));
+    hi = vmlal_u8(hi, vget_high_u8(b), vdup_n_u8(16));
+
+    uint8x16_t y = vcombine_u8(
+            vshrn_n_u16(lo, 8),
+            vshrn_n_u16(hi, 8));
+
+    y = vaddq_u8(y, vdupq_n_u8(16));
+    y = vmaxq_u8(y, vdupq_n_u8(16));
+    y = vminq_u8(y, vdupq_n_u8(235));
+    return y;
+}
+
+static inline uint8x8_t ArdaBt709LimitedChroma8(
+        uint8x8_t r,
+        uint8x8_t g,
+        uint8x8_t b,
+        int16_t cr,
+        int16_t cg,
+        int16_t cb) {
+    const int16x8_t r16 = vreinterpretq_s16_u16(vmovl_u8(r));
+    const int16x8_t g16 = vreinterpretq_s16_u16(vmovl_u8(g));
+    const int16x8_t b16 = vreinterpretq_s16_u16(vmovl_u8(b));
+
+    int32x4_t lo = vmull_n_s16(vget_low_s16(r16), cr);
+    lo = vmlal_n_s16(lo, vget_low_s16(g16), cg);
+    lo = vmlal_n_s16(lo, vget_low_s16(b16), cb);
+
+    int32x4_t hi = vmull_n_s16(vget_high_s16(r16), cr);
+    hi = vmlal_n_s16(hi, vget_high_s16(g16), cg);
+    hi = vmlal_n_s16(hi, vget_high_s16(b16), cb);
+
+    lo = vshrq_n_s32(lo, 8);
+    hi = vshrq_n_s32(hi, 8);
+
+    lo = vaddq_s32(lo, vdupq_n_s32(128));
+    hi = vaddq_s32(hi, vdupq_n_s32(128));
+
+    lo = vmaxq_s32(lo, vdupq_n_s32(16));
+    hi = vmaxq_s32(hi, vdupq_n_s32(16));
+    lo = vminq_s32(lo, vdupq_n_s32(240));
+    hi = vminq_s32(hi, vdupq_n_s32(240));
+
+    const int16x8_t uv16 =
+            vcombine_s16(vqmovn_s32(lo), vqmovn_s32(hi));
+    return vqmovun_s16(uv16);
+}
+
+static bool ArdaBt709LimitedPacked4ToI420Neon(
+        const uint8_t *src,
+        int srcStride,
+        bool memoryRgba,
+        uint8_t *dstY,
+        int dstYStride,
+        uint8_t *dstU,
+        int dstUStride,
+        uint8_t *dstV,
+        int dstVStride,
+        int width,
+        int height) {
+    if (src == nullptr ||
+        dstY == nullptr ||
+        dstU == nullptr ||
+        dstV == nullptr ||
+        srcStride <= 0 ||
+        dstYStride <= 0 ||
+        dstUStride <= 0 ||
+        dstVStride <= 0 ||
+        width <= 0 ||
+        height <= 0 ||
+        (width & 15) != 0 ||
+        (height & 1) != 0) {
+        return false;
+    }
+
+    for (int y = 0; y < height; ++y) {
+        const uint8_t *srcRow = src + y * srcStride;
+        uint8_t *dstYRow = dstY + y * dstYStride;
+
+        uint8_t *dstURow =
+                ((y & 1) == 0) ? dstU + (y >> 1) * dstUStride : nullptr;
+        uint8_t *dstVRow =
+                ((y & 1) == 0) ? dstV + (y >> 1) * dstVStride : nullptr;
+
+        for (int x = 0; x < width; x += 16) {
+            const uint8x16x4_t px = vld4q_u8(srcRow + x * 4);
+
+            const uint8x16_t r = memoryRgba ? px.val[0] : px.val[2];
+            const uint8x16_t g = px.val[1];
+            const uint8x16_t b = memoryRgba ? px.val[2] : px.val[0];
+
+            vst1q_u8(
+                    dstYRow + x,
+                    ArdaBt709LimitedY16(r, g, b));
+
+            if ((y & 1) == 0) {
+                const uint8x8_t rEven =
+                        vget_low_u8(vuzp1q_u8(r, r));
+                const uint8x8_t gEven =
+                        vget_low_u8(vuzp1q_u8(g, g));
+                const uint8x8_t bEven =
+                        vget_low_u8(vuzp1q_u8(b, b));
+
+                const uint8x8_t u = ArdaBt709LimitedChroma8(
+                        rEven, gEven, bEven,
+                        -26, -86, 112);
+                const uint8x8_t v = ArdaBt709LimitedChroma8(
+                        rEven, gEven, bEven,
+                        112, -102, -10);
+
+                vst1_u8(dstURow + (x >> 1), u);
+                vst1_u8(dstVRow + (x >> 1), v);
+            }
+        }
+    }
+
+    return true;
+}
+
+#endif  // defined(__aarch64__)
+
 status_t ConvertRGBToPlanarYUV(
         uint8_t *dstY, size_t dstStride, size_t dstVStride, size_t bufferSize,
         const C2GraphicView &src, C2Color::matrix_t colorMatrix, C2Color::range_t colorRange) {
@@ -651,6 +791,133 @@ status_t ConvertRGBToPlanarYUV(
     if (colorRange != C2Color::RANGE_FULL && colorRange != C2Color::RANGE_LIMITED) {
         colorRange = C2Color::RANGE_LIMITED;
     }
+#if defined(__aarch64__)
+    {
+        const C2PlaneInfo &ardaRPlane =
+                layout.planes[C2PlanarLayout::PLANE_R];
+        const C2PlaneInfo &ardaGPlane =
+                layout.planes[C2PlanarLayout::PLANE_G];
+        const C2PlaneInfo &ardaBPlane =
+                layout.planes[C2PlanarLayout::PLANE_B];
+
+        const bool ardaPacked4 =
+                ardaRPlane.colInc == 4 &&
+                ardaGPlane.colInc == 4 &&
+                ardaBPlane.colInc == 4 &&
+                ardaRPlane.rowInc == ardaGPlane.rowInc &&
+                ardaRPlane.rowInc == ardaBPlane.rowInc &&
+                ardaRPlane.rowInc > 0 &&
+                ardaRPlane.offset < 4 &&
+                ardaGPlane.offset < 4 &&
+                ardaBPlane.offset < 4;
+
+        const uint8_t *ardaRootR =
+                ardaPacked4 ? pRed - ardaRPlane.offset : nullptr;
+        const uint8_t *ardaRootG =
+                ardaPacked4 ? pGreen - ardaGPlane.offset : nullptr;
+        const uint8_t *ardaRootB =
+                ardaPacked4 ? pBlue - ardaBPlane.offset : nullptr;
+
+        const bool ardaSameRoot =
+                ardaPacked4 &&
+                ardaRootR == ardaRootG &&
+                ardaRootR == ardaRootB;
+
+        const bool ardaMemoryRGBA =
+                ardaSameRoot &&
+                ardaRPlane.offset == 0 &&
+                ardaGPlane.offset == 1 &&
+                ardaBPlane.offset == 2;
+
+        const bool ardaMemoryBGRA =
+                ardaSameRoot &&
+                ardaBPlane.offset == 0 &&
+                ardaGPlane.offset == 1 &&
+                ardaRPlane.offset == 2;
+
+        const int ardaWidth = static_cast<int>(src.width());
+        const int ardaHeight = static_cast<int>(src.height());
+
+        const bool ardaEligible =
+                colorMatrix == C2Color::MATRIX_BT709 &&
+                colorRange == C2Color::RANGE_LIMITED &&
+                (ardaMemoryRGBA || ardaMemoryBGRA) &&
+                (ardaWidth & 15) == 0 &&
+                (ardaHeight & 1) == 0;
+
+        if (ardaEligible) {
+            const bool ardaOk =
+                    ArdaBt709LimitedPacked4ToI420Neon(
+                            ardaRootR,
+                            ardaRPlane.rowInc,
+                            ardaMemoryRGBA,
+                            dstY,
+                            static_cast<int>(dstStride),
+                            dstU,
+                            static_cast<int>(dstStride >> 1),
+                            dstV,
+                            static_cast<int>(dstStride >> 1),
+                            ardaWidth,
+                            ardaHeight);
+
+            static bool ardaSelectedLogged = false;
+            if (!ardaSelectedLogged) {
+                ardaSelectedLogged = true;
+                ALOGE("ARDA_C2_RGB_I420_BT709_CUSTOM_NEON_V1_1"
+                      " selected=%s memory=%s width=%d height=%d"
+                      " src_stride=%d offsets=R%u,G%u,B%u"
+                      " matrix=%u range=%u"
+                      " coeffY=47,157,16 coeffU=-26,-86,112"
+                      " coeffV=112,-102,-10"
+                      " chroma=top_left_2x2 scalar_semantics=matched",
+                      ardaOk ? "YES" : "NO",
+                      ardaMemoryRGBA ? "RGBA" : "BGRA",
+                      ardaWidth,
+                      ardaHeight,
+                      ardaRPlane.rowInc,
+                      ardaRPlane.offset,
+                      ardaGPlane.offset,
+                      ardaBPlane.offset,
+                      static_cast<unsigned>(colorMatrix),
+                      static_cast<unsigned>(colorRange));
+            }
+
+            if (ardaOk) {
+                return OK;
+            }
+        } else if (colorMatrix == C2Color::MATRIX_BT709) {
+            static bool ardaFallbackLogged = false;
+            if (!ardaFallbackLogged) {
+                ardaFallbackLogged = true;
+                ALOGE("ARDA_C2_RGB_I420_BT709_CUSTOM_NEON_V1_1"
+                      " selected=NO reason=ineligible"
+                      " packed4=%d same_root=%d rgba=%d bgra=%d"
+                      " width=%d height=%d"
+                      " offsets=R%u,G%u,B%u"
+                      " col=%d,%d,%d row=%d,%d,%d"
+                      " matrix=%u range=%u",
+                      ardaPacked4,
+                      ardaSameRoot,
+                      ardaMemoryRGBA,
+                      ardaMemoryBGRA,
+                      ardaWidth,
+                      ardaHeight,
+                      ardaRPlane.offset,
+                      ardaGPlane.offset,
+                      ardaBPlane.offset,
+                      ardaRPlane.colInc,
+                      ardaGPlane.colInc,
+                      ardaBPlane.colInc,
+                      ardaRPlane.rowInc,
+                      ardaGPlane.rowInc,
+                      ardaBPlane.rowInc,
+                      static_cast<unsigned>(colorMatrix),
+                      static_cast<unsigned>(colorRange));
+            }
+        }
+    }
+#endif
+
     const int16_t (*weights)[3] =
         (colorMatrix == C2Color::MATRIX_BT709) ?
             bt709Matrix[colorRange - 1] : bt601Matrix[colorRange - 1];

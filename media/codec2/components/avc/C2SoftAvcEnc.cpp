@@ -674,6 +674,7 @@ void  C2SoftAvcEnc::initEncParams() {
     mEnableFastSad = DEFAULT_ENABLE_FAST_SAD;
     mEnableAltRef = DEFAULT_ENABLE_ALT_REF;
     mEncSpeed = DEFAULT_ENC_SPEED;
+    ALOGI("ARDA_C2SOFTAVCENC_SPEED_V1 preset=IVE_FASTEST value=%d num_cores=%zu", mEncSpeed, mNumCores);
     mIntra4x4 = DEFAULT_INTRA4x4;
     mConstrainedIntraFlag = DEFAULT_CONSTRAINED_INTRA;
     mPSNREnable = DEFAULT_PSNR_ENABLE;

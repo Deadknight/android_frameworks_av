@@ -47,7 +47,7 @@ namespace android {
 #define DEFAULT_NUM_CORES           1
 #define DEFAULT_NUM_CORES_PRE_ENC   0
 #define DEFAULT_FPS                 30
-#define DEFAULT_ENC_SPEED           IVE_NORMAL
+#define DEFAULT_ENC_SPEED           IVE_FASTEST
 
 #define DEFAULT_MEM_REC_CNT         0
 #define DEFAULT_RECON_ENABLE        0

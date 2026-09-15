@@ -123,6 +123,7 @@ static bool gSecureDisplay = false;     // should we create a secure virtual dis
 static uint32_t gVideoWidth = 0;        // default width+height
 static uint32_t gVideoHeight = 0;
 static uint32_t gBitRate = 20000000;     // 20Mbps
+static float gFrameRate = 0.0f;
 static uint32_t gTimeLimitSec = kMaxTimeLimitSec;
 static uint32_t gBframes = 0;
 static std::optional<PhysicalDisplayId> gPhysicalDisplayId;
@@ -201,7 +202,18 @@ static status_t prepareEncoder(float displayFps, sp<MediaCodec>* pCodec,
     format->setString(KEY_MIME, kMimeTypeAvc);
     format->setInt32(KEY_COLOR_FORMAT, OMX_COLOR_FormatAndroidOpaque);
     format->setInt32(KEY_BIT_RATE, gBitRate);
-    format->setFloat(KEY_FRAME_RATE, displayFps);
+    const float encoderFps = gFrameRate > 0.0f ? gFrameRate : displayFps;
+    format->setFloat(KEY_FRAME_RATE, encoderFps);
+    if (gFrameRate > 0.0f) {
+        // ARDA: cap actual Surface-input work before Codec2 encode.
+        // If --frame-rate is omitted, stock displayFps behavior is preserved.
+        format->setFloat("max-fps-to-encoder", encoderFps);
+        fprintf(stderr,
+                "ARDA_SCREENRECORD_FPS display_fps=%.2f requested_fps=%.2f encoder_fps=%.2f max_fps_to_encoder=enabled\n",
+                displayFps, gFrameRate, encoderFps);
+        ALOGI("ARDA_SCREENRECORD_FPS display_fps=%.2f requested_fps=%.2f encoder_fps=%.2f max_fps_to_encoder=enabled",
+              displayFps, gFrameRate, encoderFps);
+    }
     format->setInt32(KEY_I_FRAME_INTERVAL, 10);
     format->setInt32(KEY_MAX_B_FRAMES, gBframes);
     if (gBframes > 0) {
@@ -1243,6 +1255,9 @@ static void usage() {
         "--bugreport\n"
         "    Add additional information, such as a timestamp overlay, that is helpful\n"
         "    in videos captured to illustrate bugs.\n"
+        "--frame-rate FPS\n"
+        "    Set encoder frame rate and cap surface-input frames delivered to the encoder.\n"
+        "    Optional; if omitted, the physical display frame rate is used.\n"
         "--time-limit TIME\n"
         "    Set the maximum recording time, in seconds.  Default is %d. Set to 0\n"
         "    to remove the time limit.\n"
@@ -1271,6 +1286,7 @@ int main(int argc, char* const argv[]) {
         { "verbose",            no_argument,        NULL, 'v' },
         { "size",               required_argument,  NULL, 's' },
         { "bit-rate",           required_argument,  NULL, 'b' },
+        { "frame-rate",         required_argument,  NULL, 'F' },
         { "time-limit",         required_argument,  NULL, 't' },
         { "bugreport",          no_argument,        NULL, 'u' },
         // "unofficial" options
@@ -1327,6 +1343,21 @@ int main(int argc, char* const argv[]) {
                 return 2;
             }
             break;
+        case 'F':
+        {
+            char* next = nullptr;
+            const float frameRate = strtof(optarg, &next);
+            if (next == optarg || *next != '\0' || frameRate <= 0.0f || frameRate > 120.0f) {
+                fprintf(stderr, "Frame rate '%s' outside acceptable range (0,120]\n", optarg);
+                return 2;
+            }
+            gFrameRate = frameRate;
+            if (gVerbose) {
+                printf("Frame rate set to %.2f fps\n", gFrameRate);
+                fflush(stdout);
+            }
+            break;
+        }
         case 't':
         {
             char *next;
