@@ -18,6 +18,7 @@
 #define ANDROID_C2_SOFT_AVC_ENC_H__
 
 #include <map>
+#include <memory>
 #include <inttypes.h>
 
 #include <utils/Vector.h>
@@ -29,6 +30,8 @@
 #include "ih264e.h"
 
 namespace android {
+
+class ArdaGpuI420; // ARDA_C2_GPU_I420_V2_0
 
 #define CODEC_MAX_CORES          4
 #define LEN_STATUS_BUFFER        (10  * 1024)
@@ -212,6 +215,7 @@ private:
     std::map<const void *, std::shared_ptr<C2Buffer>> mBuffers;
     MemoryBlockPool mConversionBuffers;
     std::map<const void *, MemoryBlock> mConversionBuffersInUse;
+    std::unique_ptr<ArdaGpuI420> mGpuI420; // ARDA_C2_GPU_I420_V2_0
 
     void initEncParams();
     c2_status_t initEncoder();
@@ -239,7 +243,8 @@ private:
             const C2GraphicView *const input,
             uint8_t *base,
             uint32_t capacity,
-            uint64_t workIndex);
+            uint64_t workIndex,
+            uint8_t *preparedI420);
     void finishWork(uint64_t workIndex,
             const std::unique_ptr<C2Work> &work,
             ive_video_encode_op_t *ps_encode_op);

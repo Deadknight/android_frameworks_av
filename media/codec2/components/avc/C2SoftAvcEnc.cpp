@@ -36,6 +36,9 @@
 #include <util/C2InterfaceHelper.h>
 
 #include "C2SoftAvcEnc.h"
+#include "ArdaGpuI420.h" // ARDA_C2_GPU_I420_V2_0
+#include <cstring> // ARDA_C2_IVE_SPEED_SWITCH_V1
+#include <sys/system_properties.h> // ARDA_C2_IVE_SPEED_SWITCH_V1
 #include "ih264e.h"
 #include "ih264e_error.h"
 
@@ -618,6 +621,7 @@ C2SoftAvcEnc::C2SoftAvcEnc(
     CREATE_DUMP_FILE(mOutFile);
 
     initEncParams();
+    mGpuI420 = std::make_unique<ArdaGpuI420>(); // ARDA_C2_GPU_I420_V2_0
 }
 
 C2SoftAvcEnc::C2SoftAvcEnc(
@@ -640,6 +644,9 @@ c2_status_t C2SoftAvcEnc::onStop() {
 void C2SoftAvcEnc::onReset() {
     // TODO: use IVE_CMD_CTL_RESET?
     releaseEncoder();
+    if (mGpuI420) {
+        mGpuI420->reset(); // ARDA_C2_GPU_I420_V2_0
+    }
     if (mOutBlock) {
         mOutBlock.reset();
     }
@@ -648,6 +655,9 @@ void C2SoftAvcEnc::onReset() {
 
 void C2SoftAvcEnc::onRelease() {
     releaseEncoder();
+    if (mGpuI420) {
+        mGpuI420->reset(); // ARDA_C2_GPU_I420_V2_0
+    }
     if (mOutBlock) {
         mOutBlock.reset();
     }
@@ -673,8 +683,29 @@ void  C2SoftAvcEnc::initEncParams() {
     mDisableDeblkLevel = DEFAULT_DISABLE_DEBLK_LEVEL;
     mEnableFastSad = DEFAULT_ENABLE_FAST_SAD;
     mEnableAltRef = DEFAULT_ENABLE_ALT_REF;
+    // ARDA_C2_IVE_SPEED_SWITCH_V1
+    // Production default remains IVE_FASTEST. HIGH_SPEED is opt-in per new session.
     mEncSpeed = DEFAULT_ENC_SPEED;
-    ALOGI("ARDA_C2SOFTAVCENC_SPEED_V1 preset=IVE_FASTEST value=%d num_cores=%zu", mEncSpeed, mNumCores);
+    char ardaIveSpeed[PROP_VALUE_MAX] = {};
+    const int ardaIveSpeedLen =
+            __system_property_get("debug.arda.c2.ive_speed", ardaIveSpeed);
+    if (ardaIveSpeedLen > 0) {
+        if (std::strcmp(ardaIveSpeed, "high_speed") == 0 ||
+            std::strcmp(ardaIveSpeed, "4") == 0) {
+            mEncSpeed = IVE_HIGH_SPEED;
+        } else if (std::strcmp(ardaIveSpeed, "fastest") == 0 ||
+                   std::strcmp(ardaIveSpeed, "5") == 0) {
+            mEncSpeed = IVE_FASTEST;
+        } else {
+            ALOGW("ARDA_C2SOFTAVCENC_SPEED_SWITCH invalid=%s fallback=IVE_FASTEST",
+                  ardaIveSpeed);
+            mEncSpeed = IVE_FASTEST;
+        }
+    }
+    const char *ardaIveSpeedName =
+            (mEncSpeed == IVE_HIGH_SPEED) ? "IVE_HIGH_SPEED" : "IVE_FASTEST";
+    ALOGI("ARDA_C2SOFTAVCENC_SPEED_V2 preset=%s value=%d num_cores=%zu property=debug.arda.c2.ive_speed",
+          ardaIveSpeedName, mEncSpeed, mNumCores);
     mIntra4x4 = DEFAULT_INTRA4x4;
     mConstrainedIntraFlag = DEFAULT_CONSTRAINED_INTRA;
     mPSNREnable = DEFAULT_PSNR_ENABLE;
@@ -1489,7 +1520,8 @@ c2_status_t C2SoftAvcEnc::setEncodeArgs(
         const C2GraphicView *const input,
         uint8_t *base,
         uint32_t capacity,
-        uint64_t workIndex) {
+        uint64_t workIndex,
+        uint8_t *preparedI420) {
     iv_raw_buf_t *ps_inp_raw_buf;
     memset(ps_encode_ip, 0, sizeof(*ps_encode_ip));
     memset(ps_encode_op, 0, sizeof(*ps_encode_op));
@@ -1516,6 +1548,31 @@ c2_status_t C2SoftAvcEnc::setEncodeArgs(
     memset(ps_inp_raw_buf, 0, sizeof(iv_raw_buf_t));
     ps_inp_raw_buf->u4_size = sizeof(iv_raw_buf_t);
     ps_inp_raw_buf->e_color_fmt = mIvVideoColorFormat;
+
+    // ARDA_C2_GPU_I420_V2_0: prepared persistent-mapped I420 from V3D.
+    // Canonical C2GraphicView conversion below stays untouched for fail-open.
+    if (preparedI420 != nullptr) {
+        if (mIvVideoColorFormat != IV_YUV_420P) {
+            return C2_BAD_VALUE;
+        }
+        const uint32_t width = mSize->width;
+        const uint32_t height = mSize->height;
+        const size_t yPlaneSize = static_cast<size_t>(width) * height;
+        ps_inp_raw_buf->apv_bufs[0] = preparedI420;
+        ps_inp_raw_buf->apv_bufs[1] = preparedI420 + yPlaneSize;
+        ps_inp_raw_buf->apv_bufs[2] = preparedI420 + yPlaneSize + yPlaneSize / 4;
+        ps_inp_raw_buf->au4_wd[0] = width;
+        ps_inp_raw_buf->au4_wd[1] = width / 2;
+        ps_inp_raw_buf->au4_wd[2] = width / 2;
+        ps_inp_raw_buf->au4_ht[0] = height;
+        ps_inp_raw_buf->au4_ht[1] = height / 2;
+        ps_inp_raw_buf->au4_ht[2] = height / 2;
+        ps_inp_raw_buf->au4_strd[0] = width;
+        ps_inp_raw_buf->au4_strd[1] = width / 2;
+        ps_inp_raw_buf->au4_strd[2] = width / 2;
+        return C2_OK;
+    }
+
     if (input == nullptr) {
         if (mSawInputEOS) {
             ps_encode_ip->u4_is_last = 1;
@@ -1722,7 +1779,7 @@ void C2SoftAvcEnc::process(
         constexpr uint32_t kHeaderLength = MIN_STREAM_SIZE;
         uint8_t header[kHeaderLength];
         error = setEncodeArgs(
-                ps_encode_ip, ps_encode_op, nullptr, header, kHeaderLength, workIndex);
+                ps_encode_ip, ps_encode_op, nullptr, header, kHeaderLength, workIndex, nullptr);
         if (error != C2_OK) {
             ALOGE("setEncodeArgs failed: %d", error);
             mSignalledError = true;
@@ -1812,18 +1869,28 @@ void C2SoftAvcEnc::process(
     // }
     std::shared_ptr<C2GraphicView> view;
     std::shared_ptr<C2Buffer> inputBuffer;
+    uint8_t *gpuI420 = nullptr; // ARDA_C2_GPU_I420_V2_0
     if (!work->input.buffers.empty()) {
         inputBuffer = work->input.buffers[0];
-        view = std::make_shared<C2GraphicView>(
-                inputBuffer->data().graphicBlocks().front().map().get());
-        if (view->error() != C2_OK) {
-            ALOGE("graphic view map err = %d", view->error());
-            work->workletsProcessed = 1u;
-            return;
+        const C2ConstGraphicBlock graphicBlock =
+                inputBuffer->data().graphicBlocks().front();
+
+        if (mGpuI420 && mGpuI420->requested()) {
+            gpuI420 = mGpuI420->tryConvert(
+                    graphicBlock, mSize->width, mSize->height);
         }
-        //(b/232396154)
-        //workaround for incorrect crop size in view when using surface mode
-        view->setCrop_be(C2Rect(mSize->width, mSize->height));
+
+        if (gpuI420 == nullptr) {
+            view = std::make_shared<C2GraphicView>(graphicBlock.map().get());
+            if (view->error() != C2_OK) {
+                ALOGE("graphic view map err = %d", view->error());
+                work->workletsProcessed = 1u;
+                return;
+            }
+            //(b/232396154)
+            //workaround for incorrect crop size in view when using surface mode
+            view->setCrop_be(C2Rect(mSize->width, mSize->height));
+        }
     }
 
     do {
@@ -1850,7 +1917,8 @@ void C2SoftAvcEnc::process(
         }
 
         error = setEncodeArgs(
-                ps_encode_ip, ps_encode_op, view.get(), wView.base(), wView.capacity(), workIndex);
+                ps_encode_ip, ps_encode_op, view.get(), wView.base(), wView.capacity(),
+                workIndex, gpuI420);
         if (error != C2_OK) {
             ALOGE("setEncodeArgs failed : %d", error);
             mSignalledError = true;
@@ -1889,6 +1957,9 @@ void C2SoftAvcEnc::process(
     if (inputBuffer) {
         mBuffers[ps_encode_ip->s_inp_buf.apv_bufs[0]] = inputBuffer;
     }
+    if (gpuI420 != nullptr && mGpuI420) {
+        mGpuI420->markSubmitted(ps_encode_ip->s_inp_buf.apv_bufs[0]);
+    }
 
     /* Compute time taken for decode() */
     mTimeEnd = systemTime();
@@ -1898,6 +1969,9 @@ void C2SoftAvcEnc::process(
             ps_encode_op->s_out_buf.u4_bytes);
 
     void *freed = ps_encode_op->s_inp_buf.apv_bufs[0];
+    if (mGpuI420) {
+        mGpuI420->releaseIfFreed(freed); // ARDA_C2_GPU_I420_V2_0
+    }
     /* If encoder frees up an input buffer, mark it as free */
     if (freed != nullptr) {
         if (mBuffers.count(freed) == 0u) {
@@ -1964,7 +2038,7 @@ c2_status_t C2SoftAvcEnc::drainInternal(
         ive_video_encode_ip_t *ps_encode_ip = &s_video_encode_ip.s_ive_ip;
         ive_video_encode_op_t *ps_encode_op = &s_video_encode_op.s_ive_op;
         if (C2_OK != setEncodeArgs(ps_encode_ip, ps_encode_op, nullptr,
-                                   wView.base(), wView.capacity(), 0)) {
+                                   wView.base(), wView.capacity(), 0, nullptr)) {
             ALOGE("setEncodeArgs failed for drainInternal");
             mSignalledError = true;
             work->result = C2_CORRUPTED;
@@ -1974,6 +2048,9 @@ c2_status_t C2SoftAvcEnc::drainInternal(
         (void)ive_api_function(mCodecCtx, &s_video_encode_ip, &s_video_encode_op);
 
         void *freed = ps_encode_op->s_inp_buf.apv_bufs[0];
+        if (mGpuI420) {
+            mGpuI420->releaseIfFreed(freed); // ARDA_C2_GPU_I420_V2_0
+        }
         /* If encoder frees up an input buffer, mark it as free */
         if (freed != nullptr) {
             if (mBuffers.count(freed) == 0u) {

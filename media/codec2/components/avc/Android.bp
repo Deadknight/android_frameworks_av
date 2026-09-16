@@ -38,7 +38,12 @@ cc_library {
 
     shared_libs: ["android.media.swcodec.flags-aconfig-cc"],
 
-    srcs: ["C2SoftAvcEnc.cpp"],
+    header_libs: ["libcodec2_internal"], // ARDA_C2_GPU_I420_V2_0
+
+    srcs: [
+        "C2SoftAvcEnc.cpp",
+        "ArdaGpuI420.cpp",
+    ],
 
     export_include_dirs: ["."],
 
