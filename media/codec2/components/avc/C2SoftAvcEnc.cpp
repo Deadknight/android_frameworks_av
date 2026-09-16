@@ -38,6 +38,8 @@
 #include "C2SoftAvcEnc.h"
 #include "ArdaGpuI420.h" // ARDA_C2_GPU_I420_V2_0
 #include <cstring> // ARDA_C2_IVE_SPEED_SWITCH_V1
+#include <cerrno> // ARDA_C2_BITRATE_OVERRIDE_V1
+#include <cstdlib> // ARDA_C2_BITRATE_OVERRIDE_V1
 #include <sys/system_properties.h> // ARDA_C2_IVE_SPEED_SWITCH_V1
 #include "ih264e.h"
 #include "ih264e_error.h"
@@ -683,15 +685,24 @@ void  C2SoftAvcEnc::initEncParams() {
     mDisableDeblkLevel = DEFAULT_DISABLE_DEBLK_LEVEL;
     mEnableFastSad = DEFAULT_ENABLE_FAST_SAD;
     mEnableAltRef = DEFAULT_ENABLE_ALT_REF;
-    // ARDA_C2_IVE_SPEED_SWITCH_V1
-    // Production default remains IVE_FASTEST. HIGH_SPEED is opt-in per new session.
+    // ARDA_C2_IVE_SPEED_SWITCH_V2
+    // Production default remains IVE_FASTEST. Every other preset is opt-in.
     mEncSpeed = DEFAULT_ENC_SPEED;
     char ardaIveSpeed[PROP_VALUE_MAX] = {};
     const int ardaIveSpeedLen =
             __system_property_get("debug.arda.c2.ive_speed", ardaIveSpeed);
     if (ardaIveSpeedLen > 0) {
-        if (std::strcmp(ardaIveSpeed, "high_speed") == 0 ||
-            std::strcmp(ardaIveSpeed, "4") == 0) {
+        if (std::strcmp(ardaIveSpeed, "slowest") == 0 ||
+            std::strcmp(ardaIveSpeed, "1") == 0) {
+            mEncSpeed = IVE_SLOWEST;
+        } else if (std::strcmp(ardaIveSpeed, "normal") == 0 ||
+                   std::strcmp(ardaIveSpeed, "2") == 0) {
+            mEncSpeed = IVE_NORMAL;
+        } else if (std::strcmp(ardaIveSpeed, "fast") == 0 ||
+                   std::strcmp(ardaIveSpeed, "3") == 0) {
+            mEncSpeed = IVE_FAST;
+        } else if (std::strcmp(ardaIveSpeed, "high_speed") == 0 ||
+                   std::strcmp(ardaIveSpeed, "4") == 0) {
             mEncSpeed = IVE_HIGH_SPEED;
         } else if (std::strcmp(ardaIveSpeed, "fastest") == 0 ||
                    std::strcmp(ardaIveSpeed, "5") == 0) {
@@ -702,9 +713,27 @@ void  C2SoftAvcEnc::initEncParams() {
             mEncSpeed = IVE_FASTEST;
         }
     }
-    const char *ardaIveSpeedName =
-            (mEncSpeed == IVE_HIGH_SPEED) ? "IVE_HIGH_SPEED" : "IVE_FASTEST";
-    ALOGI("ARDA_C2SOFTAVCENC_SPEED_V2 preset=%s value=%d num_cores=%zu property=debug.arda.c2.ive_speed",
+
+    const char *ardaIveSpeedName = "IVE_FASTEST";
+    switch (mEncSpeed) {
+        case IVE_SLOWEST:
+            ardaIveSpeedName = "IVE_SLOWEST";
+            break;
+        case IVE_NORMAL:
+            ardaIveSpeedName = "IVE_NORMAL";
+            break;
+        case IVE_FAST:
+            ardaIveSpeedName = "IVE_FAST";
+            break;
+        case IVE_HIGH_SPEED:
+            ardaIveSpeedName = "IVE_HIGH_SPEED";
+            break;
+        case IVE_FASTEST:
+        default:
+            ardaIveSpeedName = "IVE_FASTEST";
+            break;
+    }
+    ALOGI("ARDA_C2SOFTAVCENC_SPEED_V3 preset=%s value=%d num_cores=%zu property=debug.arda.c2.ive_speed",
           ardaIveSpeedName, mEncSpeed, mNumCores);
     mIntra4x4 = DEFAULT_INTRA4x4;
     mConstrainedIntraFlag = DEFAULT_CONSTRAINED_INTRA;
@@ -826,7 +855,31 @@ c2_status_t C2SoftAvcEnc::setBitRate() {
     s_bitrate_ip.e_cmd = IVE_CMD_VIDEO_CTL;
     s_bitrate_ip.e_sub_cmd = IVE_CMD_CTL_SET_BITRATE;
 
-    s_bitrate_ip.u4_target_bitrate = mBitrate->value;
+    // ARDA_C2_BITRATE_OVERRIDE_V1
+    // Empty / unset / "0" preserves the production C2 bitrate exactly.
+    uint32_t ardaTargetBitrate = mBitrate->value;
+    bool ardaBitrateOverride = false;
+    char ardaBitrateProp[PROP_VALUE_MAX] = {};
+    const int ardaBitratePropLen =
+            __system_property_get("debug.arda.c2.bitrate", ardaBitrateProp);
+    if (ardaBitratePropLen > 0 && std::strcmp(ardaBitrateProp, "0") != 0) {
+        errno = 0;
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(ardaBitrateProp, &end, 10);
+        if (errno == 0 && end != ardaBitrateProp && *end == '\0' &&
+            parsed >= 4096ul && parsed <= 12000000ul) {
+            ardaTargetBitrate = static_cast<uint32_t>(parsed);
+            ardaBitrateOverride = true;
+        } else {
+            ALOGW("ARDA_C2SOFTAVCENC_BITRATE invalid=%s range=4096..12000000 fallback_c2=%u",
+                  ardaBitrateProp, mBitrate->value);
+        }
+    }
+
+    s_bitrate_ip.u4_target_bitrate = ardaTargetBitrate;
+    ALOGI("ARDA_C2SOFTAVCENC_BITRATE_V1 source=%s target_bps=%u c2_bps=%u property=debug.arda.c2.bitrate",
+          ardaBitrateOverride ? "override" : "c2",
+          ardaTargetBitrate, mBitrate->value);
 
     s_bitrate_ip.u4_timestamp_high = -1;
     s_bitrate_ip.u4_timestamp_low = -1;
